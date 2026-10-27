@@ -1,0 +1,16 @@
+# Core Dependencies (Phase 1)
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+duckduckgo-search>=7.0.0
+
+# Voice Dependencies (Phase 2)
+sounddevice>=0.4.6
+numpy>=1.24.0
+edge-tts>=6.1.0
+pygame>=2.5.0
+faster-whisper>=1.0.0
+openwakeword>=0.6.0
+
+# Future Phases (Uncomment when ready)
+# Phase 3: Memory (sqlite3 is standard library)

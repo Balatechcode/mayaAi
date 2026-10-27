@@ -1,0 +1,37 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+*.venv/
+
+# Environment secrets (MANDATORY: Never commit API keys)
+.env
+.env.local
+.env.*.local
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Audio temporary files & models
+temp_audio/
+*.mp3
+*.wav
+
+# Runtime Logs
+logs/*.log
+*.log
+
+# Memory database (Phase 3)
+*.db
+*.sqlite3
+
+# IDE & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
