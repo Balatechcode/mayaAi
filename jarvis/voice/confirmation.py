@@ -4,6 +4,14 @@ Speaks the confirmation prompt aloud and listens for affirmative ('haan' / 'yes'
 vs negative ('nahi' / 'no' / 'ruko'). Anything ambiguous or silent strictly defaults to False.
 """
 
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import re
 import logging
 from typing import Dict, Any
@@ -34,7 +42,7 @@ def voice_confirmation_handler(tool_name: str, kwargs: Dict[str, Any]) -> bool:
 
     prompt_spoken = f"Sir, I require confirmation to execute {tool_name}. Do you authorize this action?"
     print(f"\n" + "=" * 50)
-    print(f"⚠️  VOICE CONFIRMATION REQUIRED FOR: {tool_name}")
+    print(f"[!] SECURITY CONFIRMATION REQUIRED FOR: {tool_name}")
     print(f"Action: Jarvis is requesting permission to execute '{tool_name}'.")
     print("=" * 50)
 
@@ -42,7 +50,7 @@ def voice_confirmation_handler(tool_name: str, kwargs: Dict[str, Any]) -> bool:
     speak(prompt_spoken)
 
     # Listen for spoken authorization
-    print("🎙️  Listening for confirmation ('haan / yes / kar do' or 'nahi / no / ruko')...")
+    print("[*] Listening for confirmation ('haan / yes / kar do' or 'nahi / no / ruko')...")
     audio = record_command(max_duration=6.0, silence_timeout=1.2)
 
     if audio is None:

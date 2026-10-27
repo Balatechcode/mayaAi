@@ -8,6 +8,14 @@ and aggressive filtering of silence hallucinations.
 
 from __future__ import annotations
 
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import time
 import re
 import queue
@@ -145,7 +153,7 @@ class SpeechToText:
                 dtype="float32",
                 callback=audio_callback,
             ):
-                print("🎙️  Listening... (speak your command)")
+                print("[*] Listening... (speak your command)")
 
                 while True:
                     try:

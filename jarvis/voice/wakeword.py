@@ -6,6 +6,14 @@ Runs via non-blocking callback streams compatible with all Windows audio drivers
 
 from __future__ import annotations
 
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import time
 import queue
 import logging
@@ -114,7 +122,7 @@ class WakeWordListener:
         if status_callback:
             status_callback("idle")
 
-        print(f"\n💤 Standing by. Say \033[1;36m'Hey Jarvis'\033[0m to activate...")
+        print(f"\n[*] Standing by. Say \033[1;36m'Hey Jarvis'\033[0m to activate...")
         logger.info(f"Entering wake word standby loop on device [{dev_id}] @ {native_sr}Hz...")
 
         try:
@@ -148,7 +156,7 @@ class WakeWordListener:
 
                         if score >= self.threshold:
                             logger.info(f"Wake word '{self.model_name}' detected! Score: {score:.3f}")
-                            print(f"\n✨ \033[1;32mWake word detected!\033[0m (Score: {score:.2f})")
+                            print(f"\n[!] \033[1;32mWake word detected!\033[0m (Score: {score:.2f})")
                             time.sleep(0.3)
                             return True
 
