@@ -1,24 +1,23 @@
 """
 Wake Word detection engine for Jarvis Phase 2.
 Uses openwakeword to continuously listen for the wake phrase 'Hey Jarvis'.
-Runs at 16kHz mono via sounddevice.
-Also provides barge-in interruption detection to halt speech playback immediately.
+Runs via non-blocking callback streams compatible with all Windows audio drivers.
 """
 
 from __future__ import annotations
 
 import time
+import queue
 import logging
 from typing import Optional, Callable, Any
 
 from jarvis.config import (
     SAMPLE_RATE,
-    MIC_DEVICE_INDEX,
     WAKE_WORD_MODEL,
     WAKE_WORD_THRESHOLD,
     LOG_FILE,
 )
-from jarvis.voice.audio_utils import get_default_input_device
+from jarvis.voice.audio_utils import get_default_input_device, get_device_native_sr, resample_to_16k
 
 logger = logging.getLogger("JarvisVoice")
 
@@ -41,7 +40,7 @@ except ImportError:
 class WakeWordListener:
     """
     Continuous listener for 'Hey Jarvis' wake word.
-    Stream chunks into openwakeword model and triggers callback upon detection.
+    Buffers audio via callback stream, resamples to 16kHz, and feeds openwakeword.
     """
 
     def __init__(
@@ -61,7 +60,6 @@ class WakeWordListener:
                 raise RuntimeError("openwakeword is not installed. Run 'pip install openwakeword'.")
 
             try:
-                # Attempt loading model directly
                 self._model = Model(wakeword_models=[self.model_name], inference_framework="onnx")
             except Exception as e:
                 logger.info(f"Downloading openwakeword models ({e})...")
@@ -88,18 +86,9 @@ class WakeWordListener:
         model = self._load_model()
         model.reset()
 
-        # openwakeword processes audio in 1280-sample chunks (80ms at 16kHz)
-        chunk_size = 1280
-        self._is_listening = True
-
-        if status_callback:
-            status_callback("idle")
-
-        print(f"\n💤 Standing by. Say \033[1;36m'Hey Jarvis'\033[0m to activate...")
-        logger.info("Entering wake word standby loop...")
-
-        # Detect input device and channels
         dev_id = get_default_input_device()
+        native_sr = get_device_native_sr(dev_id)
+
         try:
             if dev_id is not None:
                 dev_info = sd.query_devices(dev_id, 'input')
@@ -109,32 +98,59 @@ class WakeWordListener:
         except Exception:
             channels = 1
 
+        audio_queue: queue.Queue = queue.Queue()
+
+        def audio_callback(indata, frames, time_info, status):
+            if channels > 1:
+                mono = np.mean(indata, axis=1)
+            else:
+                mono = indata.flatten()
+            audio_queue.put(mono.copy())
+
+        self._is_listening = True
+        chunk_16k_size = 1280  # openwakeword requires 1280 samples at 16kHz
+        accumulator = np.zeros(0, dtype=np.float32)
+
+        if status_callback:
+            status_callback("idle")
+
+        print(f"\n💤 Standing by. Say \033[1;36m'Hey Jarvis'\033[0m to activate...")
+        logger.info(f"Entering wake word standby loop on device [{dev_id}] @ {native_sr}Hz...")
+
         try:
             with sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=channels,
-                dtype="int16",
                 device=dev_id,
-                blocksize=chunk_size,
-            ) as stream:
+                samplerate=native_sr,
+                channels=channels,
+                dtype="float32",
+                callback=audio_callback,
+            ):
                 while self._is_listening:
-                    chunk, overflowed = stream.read(chunk_size)
-                    if channels > 1:
-                        audio_data = np.mean(chunk, axis=1).astype(np.int16)
-                    else:
-                        audio_data = chunk.flatten()
+                    try:
+                        chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
 
-                    # Feed 1280 int16 samples into openwakeword
-                    prediction = model.predict(audio_data)
+                    # Resample to 16kHz if needed
+                    chunk_16k = resample_to_16k(chunk, native_sr)
+                    accumulator = np.append(accumulator, chunk_16k)
 
-                    # Get prediction score for wake word
-                    score = prediction.get(self.model_name, 0.0)
+                    # Feed chunks of 1280 samples into openwakeword
+                    while len(accumulator) >= chunk_16k_size:
+                        sub_chunk = accumulator[:chunk_16k_size]
+                        accumulator = accumulator[chunk_16k_size:]
 
-                    if score >= self.threshold:
-                        logger.info(f"Wake word '{self.model_name}' detected! Score: {score:.3f}")
-                        print(f"\n✨ \033[1;32mWake word detected!\033[0m (Score: {score:.2f})")
-                        time.sleep(0.3)  # brief debounce
-                        return True
+                        # Convert float32 [-1.0, 1.0] to int16 [-32768, 32767]
+                        audio_int16 = (sub_chunk * 32767).clip(-32768, 32767).astype(np.int16)
+                        prediction = model.predict(audio_int16)
+
+                        score = prediction.get(self.model_name, 0.0)
+
+                        if score >= self.threshold:
+                            logger.info(f"Wake word '{self.model_name}' detected! Score: {score:.3f}")
+                            print(f"\n✨ \033[1;32mWake word detected!\033[0m (Score: {score:.2f})")
+                            time.sleep(0.3)
+                            return True
 
             return False
 

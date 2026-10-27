@@ -1,6 +1,6 @@
 """
 Speech-to-Text (STT) and Voice Activity Detection (VAD) module for Jarvis.
-Captures microphone audio at 16kHz mono via sounddevice.
+Captures microphone audio using callback streams for 100% Windows WDM-KS/WASAPI compatibility.
 Detects speech onset and stops automatically after ~1.5s of silence (or 20s max).
 Transcribes using local faster-whisper with automatic language detection (hi / en)
 and aggressive filtering of silence hallucinations.
@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import time
 import re
+import queue
 import logging
 from typing import Optional, Tuple, List, Any
 from pathlib import Path
 
 from jarvis.config import (
     SAMPLE_RATE,
-    MIC_DEVICE_INDEX,
     VAD_SILENCE_TIMEOUT,
     MAX_RECORD_SECONDS,
     WHISPER_MODEL_SIZE,
@@ -24,7 +24,7 @@ from jarvis.config import (
     WHISPER_COMPUTE_TYPE,
     LOG_FILE,
 )
-from jarvis.voice.audio_utils import get_default_input_device
+from jarvis.voice.audio_utils import get_default_input_device, get_device_native_sr, resample_to_16k
 
 logger = logging.getLogger("JarvisVoice")
 
@@ -101,30 +101,17 @@ class SpeechToText:
         energy_threshold: Optional[float] = None,
     ) -> Optional[np.ndarray]:
         """
-        Records audio from microphone using Voice Activity Detection (VAD).
-        - Listens for speech to start.
-        - Automatically terminates when silence is detected for >= silence_timeout seconds.
-        - Caps recording at max_duration.
+        Records audio from microphone using non-blocking callback stream with VAD.
+        Automatically stops when silence is detected for >= silence_timeout seconds.
+        Resamples output to 16kHz mono for Whisper.
         """
         if not _HAS_SD:
             print("Sounddevice/numpy not installed. Cannot record.")
             return None
 
-        chunk_duration = 0.1  # 100ms chunks
-        chunk_samples = int(SAMPLE_RATE * chunk_duration)
-        recorded_chunks: List[np.ndarray] = []
-
-        # Stream recording with sounddevice
-        speech_started = False
-        silence_start_time: Optional[float] = None
-        start_time = time.time()
-        initial_listen_timeout = 6.0  # seconds to wait for user to start speaking
-
-        # Compute dynamic noise floor if energy_threshold not specified
-        noise_samples: List[float] = []
-
-        # Detect input device and channels
         dev_id = get_default_input_device()
+        native_sr = get_device_native_sr(dev_id)
+
         try:
             if dev_id is not None:
                 dev_info = sd.query_devices(dev_id, 'input')
@@ -134,26 +121,42 @@ class SpeechToText:
         except Exception:
             channels = 1
 
+        audio_queue: queue.Queue = queue.Queue()
+
+        def audio_callback(indata, frames, time_info, status):
+            if channels > 1:
+                mono = np.mean(indata, axis=1)
+            else:
+                mono = indata.flatten()
+            audio_queue.put(mono.copy())
+
+        speech_started = False
+        silence_start_time: Optional[float] = None
+        start_time = time.time()
+        initial_listen_timeout = 6.0
+        noise_samples: List[float] = []
+        recorded_chunks: List[np.ndarray] = []
+
         try:
             with sd.InputStream(
-                samplerate=SAMPLE_RATE,
+                device=dev_id,
+                samplerate=native_sr,
                 channels=channels,
                 dtype="float32",
-                device=dev_id,
-                blocksize=chunk_samples,
-            ) as stream:
+                callback=audio_callback,
+            ):
                 print("🎙️  Listening... (speak your command)")
 
                 while True:
-                    chunk, overflowed = stream.read(chunk_samples)
-                    if channels > 1:
-                        chunk_flat = np.mean(chunk, axis=1)
-                    else:
-                        chunk_flat = chunk.flatten()
-                    recorded_chunks.append(chunk_flat)
+                    try:
+                        chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+
+                    recorded_chunks.append(chunk)
 
                     # Calculate RMS energy of current chunk
-                    rms = float(np.sqrt(np.mean(np.square(chunk_flat))))
+                    rms = float(np.sqrt(np.mean(np.square(chunk))))
                     elapsed = time.time() - start_time
 
                     # First 300ms: sample background noise floor
@@ -161,7 +164,7 @@ class SpeechToText:
                         noise_samples.append(rms)
                         continue
 
-                    # Establish dynamic threshold
+                    # Dynamic threshold
                     if energy_threshold is None:
                         bg_noise = float(np.mean(noise_samples)) if noise_samples else 0.005
                         thresh = max(bg_noise * 2.5, 0.012)
@@ -173,14 +176,12 @@ class SpeechToText:
                         if not speech_started:
                             speech_started = True
                             logger.info(f"Speech detected (RMS: {rms:.4f} > {thresh:.4f})")
-                        silence_start_time = None  # reset silence timer
+                        silence_start_time = None
                     else:
-                        # Below threshold
                         if speech_started:
                             if silence_start_time is None:
                                 silence_start_time = time.time()
                             elif (time.time() - silence_start_time) >= silence_timeout:
-                                # Silence threshold reached after speech
                                 logger.info(f"Silence detected ({silence_timeout}s). Ending recording.")
                                 break
 
@@ -197,8 +198,10 @@ class SpeechToText:
             if not recorded_chunks:
                 return None
 
-            audio_data = np.concatenate(recorded_chunks, axis=0)
-            return audio_data
+            raw_mono = np.concatenate(recorded_chunks, axis=0)
+            # Resample to 16kHz for Whisper
+            audio_16k = resample_to_16k(raw_mono, native_sr)
+            return audio_16k
 
         except Exception as e:
             logger.exception(f"Error recording audio: {e}")
@@ -216,7 +219,7 @@ class SpeechToText:
 
         # Check peak amplitude to discard pure silence
         peak = float(np.max(np.abs(audio_data)))
-        if peak < 0.01:
+        if peak < 0.005:
             logger.info(f"Audio peak ({peak:.4f}) is below noise threshold. Skipping transcription.")
             return None, None
 
@@ -224,17 +227,15 @@ class SpeechToText:
             model = self._load_model()
             t0 = time.time()
 
-            # Transcribe with auto language detection (hi / en)
             segments, info = model.transcribe(
                 audio_data,
                 beam_size=5,
                 language=None,  # auto-detect
                 initial_prompt=HINGLISH_INITIAL_PROMPT,
-                vad_filter=True,  # Built-in Silero-VAD filtering
+                vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
             )
 
-            # Collect segments
             text_segments = [s.text.strip() for s in segments if s.text]
             full_text = " ".join(text_segments).strip()
             detected_lang = info.language
